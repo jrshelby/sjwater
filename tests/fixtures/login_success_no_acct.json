@@ -1,0 +1,14 @@
+{
+    "VXengage_Login": {
+        "Success": true,
+        "Transaction": {
+            "Attributes": {
+                "Name": "Test User",
+                "Email": "test@example.com"
+            }
+        }
+    },
+    "Token": "new_session_token_987",
+    "Authorized": true,
+    "Valid": true
+}

@@ -1,0 +1,9 @@
+{
+    "VXengage_GetHourlyGraph": {
+        "Success": true,
+        "ComplexSlidingGraphDataSets": null,
+        "ComplexLabels": null,
+        "LastUpdated": "2024-06-06T00:00:00"
+    },
+    "Token": "rotated_token_mal"
+}

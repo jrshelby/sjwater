@@ -71,7 +71,7 @@ class SJWaterHubApiClient:
             html = await page_response.text()
 
             # 2. Extract Token using regex from the hidden input: id="Token"
-            match = re.search(r'id="Token"\s+value="([^"]+)"', html)
+            match = re.search(r'id="Token"[^>]*value="([^"]+)"', html)
             if not match:
                 _LOGGER.error("Failed to extract anti-forgery Token from the login page! The layout may have changed.")
                 return False

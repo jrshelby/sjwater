@@ -1,13 +1,11 @@
 """Data update coordinator for SJ Water Hub."""
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 from typing import TYPE_CHECKING
 
-from homeassistant.components.recorder.models import StatisticMeanType
-from homeassistant.components.recorder.statistics import async_import_statistics
 from homeassistant.const import UnitOfVolume
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
@@ -19,6 +17,8 @@ from .api import SJWaterHubApiClient
 from .const import DOMAIN
 
 if TYPE_CHECKING:
+    from homeassistant.components.recorder.models import StatisticMeanType
+    from homeassistant.components.recorder.statistics import async_import_statistics
     from homeassistant.config_entries import ConfigEntry as SJWaterConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
@@ -35,13 +35,19 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
         entry: SJWaterConfigEntry,
         client: SJWaterHubApiClient,
     ) -> None:
-        super().__init__(
-            hass,
-            _LOGGER,
-            config_entry=entry,
+        import inspect
+        init_sig = inspect.signature(DataUpdateCoordinator.__init__)
+        kwargs = dict(
             name=DOMAIN,
             update_interval=SCAN_INTERVAL,
             update_method=self._async_update_data,
+        )
+        if "config_entry" in init_sig.parameters:
+            kwargs["config_entry"] = entry
+        super().__init__(
+            hass,
+            _LOGGER,
+            **kwargs,
         )
         self.entry = entry
         self.client = client
@@ -135,7 +141,7 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
                 new_sum += entry_state
                 last_start_ts = entry_ts
 
-                utc_start = entry_start_dt.astimezone(UTC).replace(
+                utc_start = entry_start_dt.astimezone(timezone.utc).replace(
                     minute=0, second=0, microsecond=0
                 )
 
@@ -187,6 +193,8 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
         "midnight reset" artifact where a restart re-imported the day from
         sum=0 and clobbered yesterday's accumulated total.
         """
+        from homeassistant.components.recorder.models import StatisticMeanType
+        from homeassistant.components.recorder.statistics import async_import_statistics
         try:
             async_import_statistics(
                 self.hass,

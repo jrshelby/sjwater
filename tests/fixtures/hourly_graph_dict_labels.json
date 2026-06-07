@@ -1,0 +1,18 @@
+{
+    "VXengage_GetHourlyGraph": {
+        "Success": true,
+        "ComplexSlidingGraphDataSets": [
+            {
+                "label": "Hourly Usage",
+                "data": ["", "1.5", "2.0"]
+            }
+        ],
+        "ComplexLabels": [
+            "",
+            {"Date": "2024-06-06 01:00:00", "Label": "1 AM"},
+            {"Date": "2024-06-06 02:00:00", "Label": "2 AM"}
+        ],
+        "LastUpdated": "2024-06-06T02:30:00"
+    },
+    "Token": "rotated_token_dict"
+}
