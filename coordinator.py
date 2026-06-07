@@ -1,0 +1,208 @@
+"""Data update coordinator for SJ Water Hub."""
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+import json
+import logging
+from typing import TYPE_CHECKING
+
+from homeassistant.components.recorder.models import StatisticMeanType
+from homeassistant.components.recorder.statistics import async_import_statistics
+from homeassistant.const import UnitOfVolume
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.storage import Store
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.util import dt as dt_util
+from homeassistant.util.unit_conversion import VolumeConverter
+
+from .api import SJWaterHubApiClient
+from .const import DOMAIN
+
+if TYPE_CHECKING:
+    from homeassistant.config_entries import ConfigEntry as SJWaterConfigEntry
+
+_LOGGER = logging.getLogger(__name__)
+
+SCAN_INTERVAL = timedelta(hours=1)
+
+
+class SJWaterHubCoordinator(DataUpdateCoordinator):
+    """Coordinator for SJ Water Hub data fetching and state persistence."""
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: SJWaterConfigEntry,
+        client: SJWaterHubApiClient,
+    ) -> None:
+        super().__init__(
+            hass,
+            _LOGGER,
+            config_entry=entry,
+            name=DOMAIN,
+            update_interval=SCAN_INTERVAL,
+            update_method=self._async_update_data,
+        )
+        self.entry = entry
+        self.client = client
+        self._store = Store(
+            hass,
+            version=1,
+            key=f"{DOMAIN}_state_{entry.entry_id}",
+            encoder=json.JSONEncoder,
+        )
+        self._current_sum: float | None = None
+        self._last_processed_start: int | None = None
+        self._initialized = False
+        _LOGGER.debug("%s: Coordinator created", DOMAIN)
+
+    async def async_initialize(self) -> None:
+        """Restore persisted state before first refresh."""
+        _LOGGER.debug("Restoring persisted state...")
+
+        # Try restoring from disk store
+        stored = await self._store.async_load()
+        if stored:
+            self._current_sum = stored.get("current_sum")
+            self._last_processed_start = stored.get("last_processed_start")
+            _LOGGER.debug(
+                "Restored from store: current_sum=%s, last_processed_start=%s",
+                self._current_sum,
+                self._last_processed_start,
+            )
+
+        _LOGGER.debug(
+            "State recovery complete: sum=%s, last_processed=%s",
+            self._current_sum,
+            self._last_processed_start,
+        )
+        self._initialized = True
+
+    @property
+    def entity_id(self) -> str:
+        """Return the sensor entity_id for this coordinator's account."""
+        import hashlib
+        acct = hashlib.sha256(self.client.username.encode()).hexdigest()[:8]
+        return f"sensor.sjwater_{acct}_water_usage"
+
+    async def _async_update_data(self) -> dict:
+        """Update data via scraping."""
+        try:
+            # The API fetches data; last_processed_start filters already-seen readings.
+            api_data = await self.client.async_get_data("", "", None)
+            history = api_data.get("history", [])
+            latest_timestamp = api_data.get("timestamp")
+
+            if not history:
+                _LOGGER.debug("No history returned from API")
+                return self._build_return_data(self._current_sum or 0.0, 0.0, latest_timestamp)
+
+            _LOGGER.debug("API returned %d history entries", len(history))
+
+            now = dt_util.now()
+            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+            # Compute today's total from ALL history entries (not just newly-processed)
+            today_sum = 0.0
+            for entry in history:
+                entry_start_dt = entry.get("start")
+                if isinstance(entry_start_dt, datetime):
+                    entry_local = dt_util.as_local(entry_start_dt)
+                    if entry_local.date() == today_start.date():
+                        today_sum += max(0.0, float(entry.get("state", 0.0)))
+
+            new_sum = self._current_sum or 0.0
+            last_start_ts: int | None = None
+            total_stats: list[dict] = []
+
+            # The API's hourly graph returns per-hour gallons consumed (a delta
+            # per bucket), not a cumulative meter reading. Each entry_state IS
+            # the usage for that hour, so we just add it to the running sum.
+            for entry in history:
+                entry_start_dt = entry.get("start")
+                entry_state = max(0.0, float(entry.get("state", 0.0)))
+
+                if isinstance(entry_start_dt, datetime):
+                    entry_ts = int(entry_start_dt.timestamp())
+                else:
+                    continue
+
+                # Skip already-processed readings
+                if self._last_processed_start is not None and entry_ts <= self._last_processed_start:
+                    _LOGGER.debug("Skipping already-processed reading at %s", entry_ts)
+                    continue
+
+                new_sum += entry_state
+                last_start_ts = entry_ts
+
+                utc_start = entry_start_dt.astimezone(UTC).replace(
+                    minute=0, second=0, microsecond=0
+                )
+
+                # Queue a statistics row for this hour so the Energy Dashboard
+                # stays in sync with the live sensor's running total.
+                total_stats.append({
+                    "start": utc_start,
+                    "state": entry_state,
+                    "sum": new_sum,
+                })
+
+                _LOGGER.debug(
+                    "Reading: ts=%s, hourly_gal=%s, running_sum=%s",
+                    entry_ts, entry_state, new_sum,
+                )
+
+            # Persist state
+            if last_start_ts is not None:
+                self._current_sum = new_sum
+                self._last_processed_start = last_start_ts
+                await self._store.async_save({
+                    "current_sum": self._current_sum,
+                    "last_processed_start": self._last_processed_start,
+                })
+                _LOGGER.debug("Persisted: sum=%s, last_start=%s", new_sum, last_start_ts)
+
+            if total_stats:
+                self._import_stats(total_stats)
+
+            return self._build_return_data(new_sum, today_sum, latest_timestamp)
+
+        except Exception as exc:
+            _LOGGER.warning("Error fetching water data: %s", exc)
+            raise
+
+    def _build_return_data(self, current_sum: float, today_sum: float, latest_timestamp) -> dict:
+        """Build the data dict returned to sensor entities."""
+        return {
+            "current_sum": current_sum,
+            "today_sum": today_sum,
+            "timestamp": latest_timestamp,
+        }
+
+    def _import_stats(self, stats: list[dict]) -> None:
+        """Import statistics rows for newly-seen hourly buckets.
+
+        Only rows past ``_last_processed_start`` reach this point, so the
+        ``sum`` values always extend the existing series — preventing the
+        "midnight reset" artifact where a restart re-imported the day from
+        sum=0 and clobbered yesterday's accumulated total.
+        """
+        try:
+            async_import_statistics(
+                self.hass,
+                metadata={
+                    "statistic_id": self.entity_id,
+                    "source": "recorder",
+                    "mean_type": StatisticMeanType.NONE,
+                    "has_sum": True,
+                    "name": "Water Meter Total",
+                    "unit_class": VolumeConverter.UNIT_CLASS,
+                    "unit_of_measurement": UnitOfVolume.GALLONS,
+                },
+                statistics=stats,
+            )
+            _LOGGER.debug(
+                "Imported %d stats (last sum=%.1f)", len(stats), stats[-1]["sum"]
+            )
+        except Exception as exc:
+            _LOGGER.debug("Failed to import statistics: %s", exc)

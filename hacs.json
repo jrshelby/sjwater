@@ -1,0 +1,7 @@
+{
+  "name": "SJ Water Hub",
+  "content_in_root": true,
+  "domains": ["sjwater"],
+  "iot_class": "cloud_polling",
+  "render_readme": true
+}
