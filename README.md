@@ -1,4 +1,6 @@
-# SJ Water Hub
+<p style="text-align: center; font-size: 32px; font-weight: bold; display: flex; align-items: center; justify-content: center;">
+  <img src="brand/logo.png" alt="Logo" style="height: 150px; width: auto;">
+</p>
 
 Custom Home Assistant integration for **SJ Water Company** (sjwaterhub.com). Fetches hourly water usage data from the water company's web portal and exposes it as Home Assistant sensors with full Energy Dashboard support.
 
