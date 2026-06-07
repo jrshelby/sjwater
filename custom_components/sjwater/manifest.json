@@ -1,7 +1,7 @@
 {
   "domain": "sjwater",
   "name": "SJ Water Hub",
-  "codeowners": ["@greg"],
+  "codeowners": ["@gdi0110"],
   "config_flow": true,
   "dependencies": ["recorder"],
   "documentation": "https://www.home-assistant.io/integrations/sjwater",
