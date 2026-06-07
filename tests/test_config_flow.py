@@ -23,6 +23,7 @@ def _make_flow():
     flow.hass.config_entries.flow = MagicMock()
     flow.hass.config_entries.flow.async_progress_by_handler = MagicMock(return_value=[])
     flow.hass.config_entries.async_entries = MagicMock(return_value=[])
+    flow.hass.config_entries.async_entry_for_domain_unique_id = MagicMock(return_value=None)
     return flow
 
 
