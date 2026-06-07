@@ -188,3 +188,6 @@ cython_debug/
 
 # OpenSpec
 openspec/
+
+# VS Code
+.vscode/
