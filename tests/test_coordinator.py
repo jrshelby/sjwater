@@ -46,9 +46,10 @@ class TestAsyncUpdateData:
         coordinator._last_processed_start = None
 
         now = dt_util.utcnow()
+        # Older than FINALIZATION_LAG so the entries are finalized/persisted
         history = [
-            {"start": now - timedelta(hours=2), "state": "1.5"},
-            {"start": now - timedelta(hours=1), "state": "2.5"},
+            {"start": now - timedelta(hours=50), "state": "1.5"},
+            {"start": now - timedelta(hours=49), "state": "2.5"},
         ]
 
         with patch.object(coordinator.client, "async_get_data", new=AsyncMock(return_value={
@@ -113,8 +114,9 @@ class TestAsyncUpdateData:
         coordinator._last_processed_start = None
 
         now = dt_util.utcnow()
+        # Older than FINALIZATION_LAG so the entry is finalized/persisted
         history = [
-            {"start": now - timedelta(hours=1), "state": "3.0"},
+            {"start": now - timedelta(hours=49), "state": "3.0"},
         ]
 
         with patch.object(coordinator.client, "async_get_data", new=AsyncMock(return_value={
@@ -205,6 +207,138 @@ class TestAsyncUpdateData:
 
         assert result["current_sum"] == 3.0
         assert result["today_sum"] == 3.0
+
+
+class TestFinalizationWindow:
+    async def test_future_placeholder_entries_ignored(self, coordinator, mock_store):
+        coordinator._current_sum = 5.0
+        coordinator._last_processed_start = None
+
+        now = dt_util.utcnow()
+        history = [
+            {"start": now + timedelta(hours=2), "state": "0.0"},
+            {"start": now + timedelta(hours=3), "state": "7.0"},
+        ]
+
+        with patch.object(coordinator.client, "async_get_data", new=AsyncMock(return_value={
+            "gallons": 0.0,
+            "timestamp": now,
+            "last_updated": "2024-06-06T12:00:00",
+            "history": history,
+        })):
+            with patch.object(coordinator, "_import_stats") as mock_import:
+                with patch("custom_components.sjwater.coordinator.dt_util.now", return_value=now):
+                    result = await coordinator._async_update_data()
+
+        assert result["current_sum"] == 5.0
+        mock_store.async_save.assert_not_called()
+        mock_import.assert_not_called()
+
+    async def test_provisional_entries_reported_but_not_persisted(self, coordinator, mock_store):
+        coordinator._current_sum = 10.0
+        coordinator._last_processed_start = None
+
+        now = dt_util.utcnow()
+        history = [
+            {"start": now - timedelta(hours=2), "state": "1.0"},
+            {"start": now - timedelta(hours=1), "state": "2.0"},
+        ]
+
+        with patch.object(coordinator.client, "async_get_data", new=AsyncMock(return_value={
+            "gallons": 2.0,
+            "timestamp": now,
+            "last_updated": "2024-06-06T12:00:00",
+            "history": history,
+        })):
+            with patch.object(coordinator, "_import_stats") as mock_import:
+                with patch("custom_components.sjwater.coordinator.dt_util.now", return_value=now):
+                    result = await coordinator._async_update_data()
+
+        # Provisional readings reach the sensor and the statistics table...
+        assert result["current_sum"] == 13.0
+        mock_import.assert_called_once()
+        rows = mock_import.call_args[0][0]
+        assert [r["sum"] for r in rows] == [11.0, 13.0]
+        # ...but never advance the persisted watermark/sum, so late-arriving
+        # revisions for these hours are re-processed on the next poll.
+        mock_store.async_save.assert_not_called()
+
+    async def test_finalized_and_provisional_split(self, coordinator, mock_store):
+        coordinator._current_sum = 0.0
+        coordinator._last_processed_start = None
+
+        now = dt_util.utcnow()
+        old = now - timedelta(hours=50)
+        history = [
+            {"start": old, "state": "4.0"},
+            {"start": now - timedelta(hours=1), "state": "2.0"},
+        ]
+
+        with patch.object(coordinator.client, "async_get_data", new=AsyncMock(return_value={
+            "gallons": 2.0,
+            "timestamp": now,
+            "last_updated": "2024-06-06T12:00:00",
+            "history": history,
+        })):
+            with patch.object(coordinator, "_import_stats"):
+                with patch("custom_components.sjwater.coordinator.dt_util.now", return_value=now):
+                    result = await coordinator._async_update_data()
+
+        assert result["current_sum"] == 6.0
+        mock_store.async_save.assert_called_once_with({
+            "current_sum": 4.0,
+            "last_processed_start": int(old.timestamp()),
+        })
+
+    async def test_reported_sum_never_decreases(self, coordinator, mock_store):
+        coordinator._current_sum = 0.0
+        coordinator._last_processed_start = None
+        coordinator._last_reported_sum = 20.0
+
+        now = dt_util.utcnow()
+        history = [
+            {"start": now - timedelta(hours=1), "state": "2.0"},
+        ]
+
+        with patch.object(coordinator.client, "async_get_data", new=AsyncMock(return_value={
+            "gallons": 2.0,
+            "timestamp": now,
+            "last_updated": "2024-06-06T12:00:00",
+            "history": history,
+        })):
+            with patch.object(coordinator, "_import_stats"):
+                with patch("custom_components.sjwater.coordinator.dt_util.now", return_value=now):
+                    result = await coordinator._async_update_data()
+
+        # A downward provisional revision must not make the TOTAL_INCREASING
+        # sensor dip (HA would read it as a meter reset).
+        assert result["current_sum"] == 20.0
+
+
+class TestWatermarkRepair:
+    async def test_future_watermark_clamped(self, coordinator, mock_store):
+        future_ts = int(dt_util.utcnow().timestamp()) + 86400
+        mock_store.async_load.return_value = {
+            "current_sum": 100.0,
+            "last_processed_start": future_ts,
+        }
+
+        await coordinator.async_initialize()
+
+        assert coordinator._last_processed_start < int(dt_util.utcnow().timestamp())
+        assert coordinator._current_sum == 100.0
+        mock_store.async_save.assert_called_once()
+
+    async def test_past_watermark_untouched(self, coordinator, mock_store):
+        mock_store.async_load.return_value = {
+            "current_sum": 100.0,
+            "last_processed_start": 1717000000,
+        }
+
+        await coordinator.async_initialize()
+
+        assert coordinator._last_processed_start == 1717000000
+        mock_store.async_save.assert_not_called()
 
 
 class TestImportStats:

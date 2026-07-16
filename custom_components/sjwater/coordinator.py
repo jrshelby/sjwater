@@ -25,6 +25,14 @@ _LOGGER = logging.getLogger(__name__)
 
 SCAN_INTERVAL = timedelta(hours=1)
 
+# The utility publishes hourly readings 6-24h late and may revise them after
+# the fact; the API pads the current day with 0.0 placeholder rows for hours
+# that have not elapsed yet. Buckets younger than this stay "provisional":
+# they are rebuilt and re-imported on every poll (statistics import upserts
+# by hour start, so corrections overwrite placeholders) and only buckets
+# older than this are finalized into the persisted running sum.
+FINALIZATION_LAG = timedelta(hours=48)
+
 
 class SJWaterHubCoordinator(DataUpdateCoordinator):
     """Coordinator for SJ Water Hub data fetching and state persistence."""
@@ -59,6 +67,7 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
         )
         self._current_sum: float | None = None
         self._last_processed_start: int | None = None
+        self._last_reported_sum: float | None = None
         self._initialized = False
         _LOGGER.debug("%s: Coordinator created", DOMAIN)
 
@@ -76,6 +85,26 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
                 self._current_sum,
                 self._last_processed_start,
             )
+
+        # Repair a watermark that ran into the future. Earlier versions
+        # processed the API's 0.0 placeholder rows for not-yet-elapsed hours,
+        # advancing the watermark to end-of-day and permanently blocking the
+        # real readings that arrive later. Every bucket in the rewound range
+        # contributed exactly 0.0 to the sum, so no double-counting occurs
+        # when those hours are re-processed.
+        now_ts = int(dt_util.utcnow().timestamp())
+        if self._last_processed_start is not None and self._last_processed_start > now_ts:
+            clamped = int((dt_util.utcnow() - FINALIZATION_LAG).timestamp())
+            _LOGGER.info(
+                "Repairing future watermark: %s -> %s",
+                self._last_processed_start,
+                clamped,
+            )
+            self._last_processed_start = clamped
+            await self._store.async_save({
+                "current_sum": self._current_sum,
+                "last_processed_start": self._last_processed_start,
+            })
 
         _LOGGER.debug(
             "State recovery complete: sum=%s, last_processed=%s",
@@ -117,13 +146,21 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
                     if entry_local.date() == today_start.date():
                         today_sum += max(0.0, float(entry.get("state", 0.0)))
 
+            now_utc = dt_util.utcnow()
+            now_ts = int(now_utc.timestamp())
+            finalize_cutoff_ts = int((now_utc - FINALIZATION_LAG).timestamp())
+
             new_sum = self._current_sum or 0.0
             last_start_ts: int | None = None
             total_stats: list[dict] = []
+            provisional: list[tuple[int, datetime, float]] = []
 
             # The API's hourly graph returns per-hour gallons consumed (a delta
-            # per bucket), not a cumulative meter reading. Each entry_state IS
-            # the usage for that hour, so we just add it to the running sum.
+            # per bucket), not a cumulative meter reading. Buckets older than
+            # FINALIZATION_LAG are folded into the persisted running sum once;
+            # younger buckets are set aside as provisional because the utility
+            # publishes readings late and may revise them. Buckets in the
+            # future are placeholders the API pads the current day with.
             for entry in history:
                 entry_start_dt = entry.get("start")
                 entry_state = max(0.0, float(entry.get("state", 0.0)))
@@ -133,9 +170,15 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
                 else:
                     continue
 
-                # Skip already-processed readings
+                if entry_ts > now_ts:
+                    continue
+
+                if entry_ts > finalize_cutoff_ts:
+                    provisional.append((entry_ts, entry_start_dt, entry_state))
+                    continue
+
+                # Skip already-finalized readings
                 if self._last_processed_start is not None and entry_ts <= self._last_processed_start:
-                    _LOGGER.debug("Skipping already-processed reading at %s", entry_ts)
                     continue
 
                 new_sum += entry_state
@@ -154,11 +197,11 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
                 })
 
                 _LOGGER.debug(
-                    "Reading: ts=%s, hourly_gal=%s, running_sum=%s",
+                    "Finalized reading: ts=%s, hourly_gal=%s, running_sum=%s",
                     entry_ts, entry_state, new_sum,
                 )
 
-            # Persist state
+            # Persist state (finalized buckets only)
             if last_start_ts is not None:
                 self._current_sum = new_sum
                 self._last_processed_start = last_start_ts
@@ -168,10 +211,40 @@ class SJWaterHubCoordinator(DataUpdateCoordinator):
                 })
                 _LOGGER.debug("Persisted: sum=%s, last_start=%s", new_sum, last_start_ts)
 
+            # Rebuild the provisional window on top of the finalized sum every
+            # poll. async_import_statistics upserts by hour start, so rows for
+            # hours whose readings arrived or were revised since the last poll
+            # overwrite the stale placeholder rows in the statistics table.
+            provisional_sum = new_sum
+            for entry_ts, entry_start_dt, entry_state in sorted(
+                provisional, key=lambda e: e[0]
+            ):
+                provisional_sum += entry_state
+                utc_start = entry_start_dt.astimezone(timezone.utc).replace(
+                    minute=0, second=0, microsecond=0
+                )
+                total_stats.append({
+                    "start": utc_start,
+                    "state": entry_state,
+                    "sum": provisional_sum,
+                })
+            if provisional:
+                _LOGGER.debug(
+                    "Rebuilt %d provisional rows (provisional_sum=%.1f)",
+                    len(provisional), provisional_sum,
+                )
+
             if total_stats:
                 self._import_stats(total_stats)
 
-            return self._build_return_data(new_sum, today_sum, latest_timestamp)
+            # Never report a lower total than a previous poll: a downward
+            # provisional revision would otherwise read as a meter reset to
+            # the TOTAL_INCREASING sensor, booking phantom consumption.
+            if self._last_reported_sum is not None:
+                provisional_sum = max(provisional_sum, self._last_reported_sum)
+            self._last_reported_sum = provisional_sum
+
+            return self._build_return_data(provisional_sum, today_sum, latest_timestamp)
 
         except Exception as exc:
             _LOGGER.warning("Error fetching water data: %s", exc)
