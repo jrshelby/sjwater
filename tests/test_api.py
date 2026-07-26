@@ -31,12 +31,19 @@ class TestAsyncLogin:
         assert get_call is not None
         assert "sjwaterhub.com/Login" in str(get_call[0][0])
 
+        # First POST registers the anti-forgery token, second POST logs in
+        assert mock_session.post.call_count == 2
+        cep_call = mock_session.post.call_args_list[0]
+        assert "CreateExceptionPermissions" in str(cep_call[0][0])
+        assert cep_call[1]["data"]["token"] == "abc123def456token789"
+
         post_call = mock_session.post.call_args
         assert post_call is not None
         assert "RequestBroker" in str(post_call[0][0])
         headers = post_call[1].get("headers", {})
         assert headers.get("X-Requested-With") == "XMLHttpRequest"
-        assert "application/x-www-form-urlencoded" in headers.get("Content-Type", "")
+        assert "application/json" in headers.get("Content-Type", "")
+        assert headers.get("User-Agent", "").startswith("Mozilla/5.0")
 
     async def test_missing_token_in_html(self, api_client, mock_session, mock_get_factory):
         mock_get_factory(text=load_fixture("login_page_no_token.html"))
@@ -70,6 +77,25 @@ class TestAsyncLogin:
         await api_client.async_login()
 
         assert api_client._account_guid is None
+
+    async def test_login_page_get_uses_browser_headers(self, api_client, mock_session, mock_get_factory, mock_post_factory):
+        mock_get_factory(text=load_fixture("login_page.html"))
+        mock_post_factory(data=load_json_fixture("login_success.json"))
+
+        await api_client.async_login()
+
+        get_headers = mock_session.get.call_args[1].get("headers", {})
+        assert get_headers.get("User-Agent", "").startswith("Mozilla/5.0")
+
+    async def test_token_registered_before_login(self, api_client, mock_session, mock_get_factory, mock_post_factory):
+        mock_get_factory(text=load_fixture("login_page.html"))
+        mock_post_factory(data=load_json_fixture("login_success.json"))
+
+        await api_client.async_login()
+
+        urls = [str(c[0][0]) for c in mock_session.post.call_args_list]
+        assert "CreateExceptionPermissions" in urls[0]
+        assert "RequestBroker" in urls[1]
 
 
 class TestAsyncVerifyCredentials:
@@ -142,6 +168,9 @@ class TestAsyncGetData:
             if call_count[0] == 1:
                 return _make_async_resp(data=hourly_expired)
             elif call_count[0] == 2:
+                # CreateExceptionPermissions token registration
+                return _make_async_resp(data={})
+            elif call_count[0] == 3:
                 return _make_async_resp(data=login_ok)
             else:
                 return _make_async_resp(data=hourly_ok)
@@ -179,18 +208,20 @@ class TestPostRequest:
         url = str(call_args[0][0])
         assert "RequestBroker" in url
 
-        data = call_args[1].get("data", {})
-        assert "Request" in data
+        outer = json.loads(call_args[1].get("data"))
+        assert "Request" in outer
 
-        inner = json.loads(data["Request"])
+        inner = json.loads(outer["Request"])
         assert inner["Actions"] == "TestAction"
         assert inner["ViewName"] == "TestView"
         assert inner["Token"] == "test_token"
-        assert inner["IsMobile"] is False
+        assert "IsMobile" not in inner
 
         headers = call_args[1].get("headers", {})
         assert headers.get("X-Requested-With") == "XMLHttpRequest"
-        assert "application/x-www-form-urlencoded" in headers.get("Content-Type", "")
+        assert "application/json" in headers.get("Content-Type", "")
+        assert headers.get("User-Agent", "").startswith("Mozilla/5.0")
+        assert headers.get("Origin") == "https://www.sjwaterhub.com"
 
     async def test_include_payload_additions(self, api_client, mock_session, mock_post_factory):
         api_client._token = "token"
@@ -199,8 +230,7 @@ class TestPostRequest:
         await api_client._post_request("Action", "View", {"ExtraKey": "ExtraVal"})
 
         call_args = mock_session.post.call_args
-        data = call_args[1].get("data", {})
-        inner = json.loads(data["Request"])
+        inner = json.loads(json.loads(call_args[1].get("data"))["Request"])
         assert inner["ExtraKey"] == "ExtraVal"
 
     async def test_raises_on_http_error(self, api_client, mock_session):
@@ -266,8 +296,7 @@ class TestAsyncGetDataEdgeCases:
         assert len(result["history"]) > 0
 
         call_args = mock_session.post.call_args
-        data = call_args[1].get("data", {})
-        inner = json.loads(data["Request"])
+        inner = json.loads(json.loads(call_args[1].get("data"))["Request"])
         assert inner["AccountNumber"] == "42"
 
     async def test_dict_type_labels(self, authenticated_client, mock_session, mock_post_factory):

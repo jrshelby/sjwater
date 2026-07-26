@@ -10,6 +10,13 @@ from homeassistant.util import dt as dt_util
 
 _LOGGER = logging.getLogger(__name__)
 
+# The portal silently rejects logins from non-browser clients (Success=false,
+# ErrorCode=0), so all requests must present browser-like headers.
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
 
 class InvalidAuth(HomeAssistantError):
     """Error to indicate authentication failure."""
@@ -31,10 +38,10 @@ class SJWaterHubApiClient:
     async def _post_request(self, actions: str, view_name: str, payload_additions: dict = None) -> dict:
         """Helper to send the double-encoded JSON the RequestBroker API expects."""
 
-        # Build the inner JSON payload
+        # Build the inner JSON payload (mirrors the fields the portal's own
+        # requestBroker() JS helper sends -- no extras like IsMobile)
         inner_payload = {
             "Actions": actions,
-            "IsMobile": False,
             "Token": self._token if self._token else "",
             "ViewName": view_name,
             "SitePrefix": ""
@@ -48,14 +55,20 @@ class SJWaterHubApiClient:
             "Request": json.dumps(inner_payload)
         }
 
+        # Match the browser's $.ajax call exactly: JSON body, browser headers
         headers = {
             "X-Requested-With": "XMLHttpRequest",
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"
+            "Content-Type": "application/json;charset=utf-8",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "User-Agent": BROWSER_USER_AGENT,
+            "Accept-Language": "en-US,en;q=0.9",
+            "Origin": "https://www.sjwaterhub.com",
+            "Referer": "https://www.sjwaterhub.com/Login",
         }
 
         _LOGGER.debug("Sending RequestBroker Actions: %s", actions)
 
-        async with self.session.post(self.base_url, data=outer_payload, headers=headers) as response:
+        async with self.session.post(self.base_url, data=json.dumps(outer_payload), headers=headers) as response:
             response.raise_for_status()
             response_json = await response.json()
             return response_json
@@ -66,7 +79,12 @@ class SJWaterHubApiClient:
         # 1. Provide the necessary GET request to establish initially required cookies
         #    such as 'ApplicationGatewayAffinity' and extract the anti-forgery Token.
         login_url = "https://www.sjwaterhub.com/Login"
-        async with self.session.get(login_url) as page_response:
+        get_headers = {
+            "User-Agent": BROWSER_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        async with self.session.get(login_url, headers=get_headers) as page_response:
             page_response.raise_for_status()
             html = await page_response.text()
 
@@ -79,6 +97,23 @@ class SJWaterHubApiClient:
             self._token = match.group(1)
             _LOGGER.debug("Extracted initial session Token")
 
+        # 2b. Register the token with the server, mirroring createExceptions()
+        # in the portal's page-load JS -- login is rejected without this step.
+        exc_headers = {
+            "X-Requested-With": "XMLHttpRequest",
+            "User-Agent": BROWSER_USER_AGENT,
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Origin": "https://www.sjwaterhub.com",
+            "Referer": "https://www.sjwaterhub.com/Login",
+        }
+        async with self.session.post(
+            "https://www.sjwaterhub.com/api/WebApi/CreateExceptionPermissions",
+            data={"token": self._token, "sitePrefix": ""},
+            headers=exc_headers,
+        ) as exc_response:
+            _LOGGER.debug("CreateExceptionPermissions status: %s", exc_response.status)
+
         # 3. Use the extracted token to login
         login_additions = {
             "UserName": self.username,
@@ -90,6 +125,11 @@ class SJWaterHubApiClient:
         }
 
         data = await self._post_request("VXengage_Login", "Login", login_additions)
+
+        _LOGGER.debug(
+            "Login response (Token redacted): %s",
+            json.dumps({k: v for k, v in data.items() if k != "Token"}, default=str),
+        )
 
         _LOGGER.debug("Login completed")
 
